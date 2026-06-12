@@ -1,0 +1,59 @@
+# 环境变量（含 API Key，绝对不能提交）
+.env
+
+# Python 虚拟环境
+.venv/
+venv/
+
+# Python 缓存
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# 上传文件
+uploads/
+
+# 日志
+logs/
+*.log
+
+# 开发过程文件
+docs/
+app/test/
+CHANGELOG.md
+
+# GraphRAG 内部模块（不对外发布）
+app/graphrag/course/
+app/graphrag/dev/
+app/graphrag/docs/
+app/graphrag/examples_notebooks/
+app/graphrag/tests/
+app/graphrag/.github/
+app/graphrag/.semversioner/
+app/graphrag/venv/
+
+# GraphRAG 数据和输出（体积大，含 PDF、向量等二进制文件）
+app/graphrag/output/
+app/graphrag/cache/
+app/graphrag/test_data/
+app/graphrag/data/output/
+app/graphrag/data/cache/
+app/graphrag/data/*.pdf
+
+# LanceDB 向量数据
+*.lance/
+
+# 大型二进制文件
+*.pdf
+*.parquet
+*.zip
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
