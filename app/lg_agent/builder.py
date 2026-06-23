@@ -1,9 +1,11 @@
 import base64
+import io
 import json
 from pathlib import Path
 from typing import cast, Literal, List, Dict
 
 import aiohttp
+from PIL import Image
 from pydantic import BaseModel, Field
 from langchain_core.runnables import RunnableConfig
 from langchain_core.messages import BaseMessage, AIMessage
@@ -25,6 +27,7 @@ from app.lg_agent.prompts import (
     GENERAL_QUERY_SYSTEM_PROMPT,
     GET_IMAGE_SYSTEM_PROMPT,
     GUARDRAILS_SYSTEM_PROMPT,
+    IMAGE_ANALYSIS_SYSTEM_PROMPT,
 )
 
 
@@ -219,135 +222,114 @@ async def get_additional_info(
         response = await model.ainvoke(messages)
         return {"messages": [response]}
 
+
+# ---- image-query helpers ----
+
+MAX_IMAGE_SIZE = 1024          # 长边最大像素，超过则等比缩小
+JPEG_QUALITY = 85             # 压缩后 JPEG 质量
+VISION_MAX_TOKENS = 4000      # 视觉模型单次返回上限
+
+# 图片相关的兜底话术：区分"图片本身的问题"和"服务端的问题"
+IMAGE_REUPLOAD_MSG = "抱歉，我无法查看这张图片，请重新上传。"
+IMAGE_SERVICE_ERROR_MSG = "抱歉，图片识别服务暂时不可用，请稍后再试~"
+
+
+def _encode_image(image_path: str) -> str:
+    """读取图片，等比压缩到长边 <= MAX_IMAGE_SIZE，转 JPEG 后做 base64 编码。"""
+    with Image.open(image_path) as img:
+        width, height = img.size
+        if width > MAX_IMAGE_SIZE or height > MAX_IMAGE_SIZE:
+            ratio = min(MAX_IMAGE_SIZE / width, MAX_IMAGE_SIZE / height)
+            img = img.resize((int(width * ratio), int(height * ratio)), Image.LANCZOS)
+        if img.mode != "RGB":
+            img = img.convert("RGB")
+        buffer = io.BytesIO()
+        img.save(buffer, format="JPEG", quality=JPEG_QUALITY)
+        logger.info(f"Image compressed from {width}x{height} to {img.width}x{img.height}")
+        return base64.b64encode(buffer.getvalue()).decode("utf-8")
+
+
+async def _describe_image(image_data: str) -> str:
+    """调用视觉模型，返回对图片的文字描述；HTTP 失败时抛异常。"""
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {settings.VISION_API_KEY}",
+    }
+    payload = {
+        "model": settings.VISION_MODEL,
+        "messages": [
+            {"role": "system", "content": IMAGE_ANALYSIS_SYSTEM_PROMPT},
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": f"data:image/jpeg;base64,{image_data}"},
+                    }
+                ],
+            },
+        ],
+        "max_tokens": VISION_MAX_TOKENS,
+        "temperature": 0.7,
+    }
+    async with aiohttp.ClientSession() as session:
+        async with session.post(
+            f"{settings.VISION_BASE_URL}/chat/completions",
+            headers=headers,
+            json=payload,
+            timeout=60,
+        ) as response:
+            if response.status != 200:
+                error_text = await response.text()
+                raise RuntimeError(f"vision API returned {response.status}: {error_text}")
+            result = await response.json()
+            return result["choices"][0]["message"]["content"]
+
+
 async def create_image_query(
     state: AgentState, *, config: RunnableConfig
 ) -> Dict[str, List[BaseMessage]]:
-    """处理图片查询并生成描述回复
-    
-    Args:
-        state (AgentState): 当前代理状态，包括对话历史
-        config (RunnableConfig): 配置参数，包含线程ID等配置信息
-        
-    Returns:
-        Dict[str, List[BaseMessage]]: 包含'messages'键的字典，其中包含生成的响应
+    """处理图片查询：视觉模型先描述图片，再由客服模型组织成回复。
+
+    错误分两类，不再把所有失败都甩成"请重新上传"：
+    - 图片本身的问题（没传 / 损坏）   -> 让用户重传
+    - 视觉服务的问题（未配置 / 调用失败）-> 让用户稍后再试
     """
-    logger.info("-----Found User Upload Image-----")    
+    logger.info("-----Found User Upload Image-----")
     image_path = config.get("configurable", {}).get("image_path", None)
 
+    # 1. 图片本身的问题 -> 让用户重传
     if not image_path or not Path(image_path).exists():
-        logger.warning(f"User Upload Image Not Found: {image_path}")
-        return {"messages": [AIMessage(content="抱歉，我无法查看这张图片，请重新上传。")]}
-    
-    # 获取视觉模型配置
-    api_key = settings.VISION_API_KEY
-    base_url = settings.VISION_BASE_URL
-    vision_model = settings.VISION_MODEL
-    
-    if not api_key or not base_url or not vision_model:
-        logger.error("Vision Model Configuration Not Complete")
-        return {"messages": [AIMessage(content="抱歉，我无法查看这张图片，请重新上传。")]}
-    
-    logger.info(f"Using Vision Model: {vision_model} to process image: {image_path}")
-    
+        logger.warning(f"User upload image not found: {image_path}")
+        return {"messages": [AIMessage(content=IMAGE_REUPLOAD_MSG)]}
+
+    # 2. 视觉服务未配置 -> 服务端问题，不该怪用户
+    if not (settings.VISION_API_KEY and settings.VISION_BASE_URL and settings.VISION_MODEL):
+        logger.error("Vision model configuration is incomplete")
+        return {"messages": [AIMessage(content=IMAGE_SERVICE_ERROR_MSG)]}
+
+    # 3. 读图 / 压缩失败 -> 多半是图片损坏，让用户重传
     try:
-        # 导入图片处理库
-        from PIL import Image
-        import io
-        
-        # 读取并压缩图片
-        with Image.open(image_path) as img:
-            # 设置最大尺寸
-            max_size = 1024
-            # 计算缩放比例
-            width, height = img.size
-            ratio = min(max_size / width, max_size / height)
-            
-            # 如果图片尺寸已经小于最大尺寸，不需要缩放
-            if width <= max_size and height <= max_size:
-                resized_img = img
-            else:
-                new_width = int(width * ratio)
-                new_height = int(height * ratio)
-                resized_img = img.resize((new_width, new_height), Image.LANCZOS)
-            
-            # 转换为JPEG格式，并调整质量
-            img_byte_arr = io.BytesIO()
-            if resized_img.mode != 'RGB':
-                resized_img = resized_img.convert('RGB')
-            resized_img.save(img_byte_arr, format='JPEG', quality=85)
-            img_byte_arr.seek(0)
-            
-            # 转换为base64
-            image_data = base64.b64encode(img_byte_arr.read()).decode('utf-8')
-            
-            logger.info(f"Image Compressed, Original Size: {width}x{height}, New Size: {resized_img.width}x{resized_img.height}")
-        
-        # 构建API请求
-        headers = {
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {api_key}"
-        }
-        
-        payload = {
-            "model": vision_model,
-            "messages": [
-                {
-                    "role": "system",
-                    "content": "你是一个专业的图像分析助手。请详细分析图片中的内容，特别关注产品细节、品牌、型号等信息。"
-                },
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "image_url",
-                            "image_url": {
-                                "url": f"data:image/jpeg;base64,{image_data}"
-                            }
-                        }
-                    ]
-                }
-            ],
-            "max_tokens": 4000,
-            "temperature": 0.7
-        }
-        
-        # 发送API请求
-        async with aiohttp.ClientSession() as session:
-            async with session.post(
-                f"{base_url}/chat/completions",
-                headers=headers,
-                json=payload,
-                timeout=60  # 增加超时时间
-            ) as response:
-                if response.status == 200:
-                    result = await response.json()
-                    image_description = result["choices"][0]["message"]["content"]
-                    logger.info(f"Successfully processed image and generated description")
-                    # 使用图片描述和用户问题生成最终回复
-                    # 从prompts导入电商客服模板
-                    
-                    # 构建回复请求
-                    model = LLMFactory.create_agent_model(tags=["image_query"])
-                    # 使用专门的图片查询提示模板
-                    system_prompt = GET_IMAGE_SYSTEM_PROMPT.format(
-                        image_description=image_description
-                    )
-                    messages = [{"role": "system", "content": system_prompt}] + state.messages
-                    response = await model.ainvoke(messages)
-                    return {"messages": [response]}    
-        
-                else:
-                    error_text = await response.text()
-                    logger.error(f"Vision API Request Failed: {response.status} - {error_text}")
-                    return {"messages": [AIMessage(content=f"抱歉，我无法查看这张图片，请重新上传。")]}
-
-
-
-
-
+        image_data = _encode_image(image_path)
     except Exception as e:
-        logger.error(f"Error processing image: {str(e)}")
-        return {"messages": [AIMessage(content=f"抱歉，我无法查看这张图片，请重新上传。")]}
+        logger.error(f"Failed to read image {image_path}: {e}")
+        return {"messages": [AIMessage(content=IMAGE_REUPLOAD_MSG)]}
+
+    # 4. 调用视觉模型失败 -> 服务端问题，让用户稍后再试
+    try:
+        image_description = await _describe_image(image_data)
+    except Exception as e:
+        logger.error(f"Vision API call failed: {e}")
+        return {"messages": [AIMessage(content=IMAGE_SERVICE_ERROR_MSG)]}
+
+    # 5. 用图片描述 + 历史，生成电商客服口吻的回复
+    logger.info("Vision model produced a description; generating the reply")
+    model = LLMFactory.create_agent_model(tags=["image_query"])
+    system_prompt = GET_IMAGE_SYSTEM_PROMPT.format(image_description=image_description)
+    messages = [{"role": "system", "content": system_prompt}] + state.messages
+    response = await model.ainvoke(messages)
+    return {"messages": [response]}
+
 
 async def create_file_query(
     state: AgentState, *, config: RunnableConfig
