@@ -75,3 +75,61 @@ async def test_additional_info_survives_neo4j_being_down(monkeypatch):
     result = await builder.get_additional_info(state, config={})
 
     assert "没有这方面的商品" in result["messages"][0].content
+
+
+async def test_image_query_reports_service_error_when_vision_fails(monkeypatch, tmp_path):
+    """A vision-service failure should say 'try later', not 'reupload' — the
+    image was fine, the problem is server-side."""
+    img = tmp_path / "pic.jpg"
+    img.write_bytes(b"fake")  # only needs to exist; _encode_image is mocked
+
+    monkeypatch.setattr(builder.settings, "VISION_API_KEY", "k")
+    monkeypatch.setattr(builder.settings, "VISION_BASE_URL", "http://x")
+    monkeypatch.setattr(builder.settings, "VISION_MODEL", "m")
+    monkeypatch.setattr(builder, "_encode_image", lambda path: "ZmFrZQ==")
+
+    async def _fail(image_data):
+        raise RuntimeError("vision down")
+
+    monkeypatch.setattr(builder, "_describe_image", _fail)
+
+    state = AgentState(
+        messages=[HumanMessage(content="看看这个")],
+        router={"type": "image-query", "logic": ""},
+    )
+    result = await builder.create_image_query(
+        state, config={"configurable": {"image_path": str(img)}}
+    )
+    assert "暂时不可用" in result["messages"][0].content
+
+
+async def test_image_query_happy_path_feeds_description_into_reply(monkeypatch, tmp_path):
+    img = tmp_path / "pic.jpg"
+    img.write_bytes(b"fake")
+
+    monkeypatch.setattr(builder.settings, "VISION_API_KEY", "k")
+    monkeypatch.setattr(builder.settings, "VISION_BASE_URL", "http://x")
+    monkeypatch.setattr(builder.settings, "VISION_MODEL", "m")
+    monkeypatch.setattr(builder, "_encode_image", lambda path: "ZmFrZQ==")
+
+    async def _describe(image_data):
+        return "一把智能门锁"
+
+    monkeypatch.setattr(builder, "_describe_image", _describe)
+
+    fake_model = MagicMock()
+    fake_model.ainvoke = AsyncMock(return_value=AIMessage(content="亲~这是智能门锁哦😊"))
+    monkeypatch.setattr(builder.LLMFactory, "create_agent_model", lambda **kwargs: fake_model)
+
+    state = AgentState(
+        messages=[HumanMessage(content="这是啥")],
+        router={"type": "image-query", "logic": ""},
+    )
+    result = await builder.create_image_query(
+        state, config={"configurable": {"image_path": str(img)}}
+    )
+
+    assert result["messages"][0].content == "亲~这是智能门锁哦😊"
+    # the vision description was injected into the reply's system prompt
+    sent = fake_model.ainvoke.call_args.args[0]
+    assert "一把智能门锁" in sent[0]["content"]
