@@ -1,6 +1,5 @@
-from pydantic import BaseModel, Field
 from dataclasses import dataclass, field
-from typing import Annotated, Literal, TypedDict, List
+from typing import Annotated, Literal, TypedDict
 from langchain_core.messages import AnyMessage
 from langgraph.graph import add_messages
 
@@ -10,13 +9,6 @@ class Router(TypedDict):
     logic: str
     type: Literal["general-query", "additional-query", "graphrag-query", "image-query", "file-query"]
     question: str = field(default_factory=str)
-
-class GradeHallucinations(BaseModel):
-    """Binary score for hallucination present in generation answer."""
-
-    binary_score: str = Field(
-        description="Answer is grounded in the facts, '1' or '0'"
-    )
 
 # @dataclass(kw_only=True)： 强制要求数据类中的所有字段必须以关键字参数的形式提供。即不能以位置参数的方式传递。
 @dataclass(kw_only=True)
@@ -69,6 +61,5 @@ class AgentState(InputState):
     """The router's classification of the user's query."""
     steps: list[str] = field(default_factory=list)
     """Populated by the retriever. This is a list of documents that the agent can reference."""
-    question: str = field(default_factory=str) 
-    answer: str = field(default_factory=str)  
-    hallucination: GradeHallucinations = field(default_factory=lambda: GradeHallucinations(binary_score="0"))
+    question: str = field(default_factory=str)
+    answer: str = field(default_factory=str)

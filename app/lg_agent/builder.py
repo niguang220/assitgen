@@ -1,45 +1,31 @@
-from app.lg_agent.lg_states import AgentState, Router
-from app.lg_agent.lg_prompts import (
+import base64
+import json
+from pathlib import Path
+from typing import cast, Literal, List, Dict
+
+import aiohttp
+from pydantic import BaseModel, Field
+from langchain_core.runnables import RunnableConfig
+from langchain_core.messages import BaseMessage, AIMessage
+from langchain_core.prompts import ChatPromptTemplate
+from langgraph.checkpoint.memory import MemorySaver
+from langgraph.graph import START, StateGraph
+
+from app.core.config import settings
+from app.core.logger import get_logger
+from app.services.llm_factory import LLMFactory
+from app.lg_agent.state import AgentState, InputState, Router
+from app.lg_agent.kg_sub_graph.kg_neo4j_conn import get_neo4j_graph
+from app.lg_agent.kg_sub_graph.agentic_rag_agents.retrievers.cypher_examples.northwind_retriever import NorthwindCypherRetriever
+from app.lg_agent.kg_sub_graph.agentic_rag_agents.workflows.multi_agent.multi_tool import create_multi_tool_workflow
+from app.lg_agent.kg_sub_graph.agentic_rag_agents.components.utils.utils import retrieve_and_parse_schema_from_graph_for_prompts
+from app.lg_agent.prompts import (
     ROUTER_SYSTEM_PROMPT,
     GET_ADDITIONAL_SYSTEM_PROMPT,
     GENERAL_QUERY_SYSTEM_PROMPT,
     GET_IMAGE_SYSTEM_PROMPT,
     GUARDRAILS_SYSTEM_PROMPT,
-    RAGSEARCH_SYSTEM_PROMPT,
-    CHECK_HALLUCINATIONS,
-    GENERATE_QUERIES_SYSTEM_PROMPT
 )
-from langchain_core.runnables import RunnableConfig
-from langchain_deepseek import ChatDeepSeek
-from langchain_ollama import ChatOllama
-from app.core.config import settings, ServiceType
-from app.core.logger import get_logger
-from typing import cast, Literal, TypedDict, List, Dict, Any
-from langchain_core.messages import BaseMessage
-from langgraph.checkpoint.memory import MemorySaver
-from langgraph.graph import END, START, StateGraph
-from app.lg_agent.lg_states import AgentState, InputState, Router, GradeHallucinations
-from app.lg_agent.kg_sub_graph.agentic_rag_agents.retrievers.cypher_examples.northwind_retriever import NorthwindCypherRetriever
-from app.lg_agent.kg_sub_graph.agentic_rag_agents.components.planner.node import create_planner_node
-from app.lg_agent.kg_sub_graph.agentic_rag_agents.workflows.multi_agent.multi_tool import create_multi_tool_workflow
-from app.lg_agent.kg_sub_graph.kg_neo4j_conn import get_neo4j_graph
-from pydantic import BaseModel
-from typing import Dict, List
-from langchain_core.messages import AIMessage
-from langchain_core.runnables.base import Runnable
-from app.lg_agent.kg_sub_graph.agentic_rag_agents.components.utils.utils import retrieve_and_parse_schema_from_graph_for_prompts
-from langchain_core.prompts import ChatPromptTemplate
-import base64
-import os
-import aiohttp
-import asyncio
-import json
-import time
-from pathlib import Path
-
-
-from typing import Literal
-from pydantic import BaseModel, Field
 
 
 class AdditionalGuardrailsOutput(BaseModel):
@@ -52,7 +38,20 @@ class AdditionalGuardrailsOutput(BaseModel):
 
 
 # 构建日志记录器
-logger = get_logger(service="lg_builder")
+logger = get_logger(service="builder")
+
+# 电商经营范围描述，供 guardrails 判断与研究计划节点共用
+ECOMMERCE_SCOPE_DESCRIPTION = """
+    个人电商经营范围：智能家居产品，包括但不限于：
+    - 智能照明（灯泡、灯带、开关）
+    - 智能安防（摄像头、门锁、传感器）
+    - 智能控制（温控器、遥控器、集线器）
+    - 智能音箱（语音助手、音响）
+    - 智能厨电（电饭煲、冰箱、洗碗机）
+    - 智能清洁（扫地机器人、洗衣机）
+
+    不包含：服装、鞋类、体育用品、化妆品、食品等非智能家居产品。
+    """
 
 async def analyze_and_route_query(
     state: AgentState, *, config: RunnableConfig
@@ -70,12 +69,8 @@ async def analyze_and_route_query(
         dict[str, Router]: A dictionary containing the 'router' key with the classification result (classification type and logic).
     """
     # 选择模型实例，通过.env文件中的AGENT_SERVICE参数选择
-    if settings.AGENT_SERVICE == ServiceType.DEEPSEEK:
-        model = ChatDeepSeek(api_key=settings.DEEPSEEK_API_KEY, model_name=settings.DEEPSEEK_MODEL, temperature=0.7, tags=["router"])
-        logger.info(f"Using DeepSeek model: {settings.DEEPSEEK_MODEL}")
-    else:
-        model = ChatOllama(model=settings.OLLAMA_AGENT_MODEL, base_url=settings.OLLAMA_BASE_URL, temperature=0.7, tags=["router"])
-        logger.info(f"Using Ollama model: {settings.OLLAMA_AGENT_MODEL}")
+    model = LLMFactory.create_agent_model(tags=["router"])
+    logger.info(f"Using agent model service: {settings.AGENT_SERVICE}")
 
     # 拼接提示模版 + 用户的实时问题（包含历史上下文对话） 
     messages = [
@@ -103,11 +98,6 @@ def route_query(
         Literal["respond_to_general_query", "get_additional_info", "create_research_plan", "create_image_query", "create_file_query"]: 下一步操作。
     """
     _type = state.router["type"]
-    
-    # 检查配置中是否有图片路径，如果有，优先处理为图片查询
-    if hasattr(state, "config") and state.config and state.config.get("configurable", {}).get("image_path"):
-        logger.info("检测到图片路径，转为图片查询处理")
-        return "create_image_query"
 
     if _type == "general-query":
         return "respond_to_general_query"
@@ -139,10 +129,7 @@ async def respond_to_general_query(
     logger.info("-----generate general-query response-----")
     
     # 使用大模型生成回复
-    if settings.AGENT_SERVICE == ServiceType.DEEPSEEK:
-        model = ChatDeepSeek(api_key=settings.DEEPSEEK_API_KEY, model_name=settings.DEEPSEEK_MODEL, temperature=0.7, tags=["general_query"])
-    else:
-        model = ChatOllama(model=settings.OLLAMA_AGENT_MODEL, base_url=settings.OLLAMA_BASE_URL, temperature=0.7, tags=["general_query"])
+    model = LLMFactory.create_agent_model(tags=["general_query"])
     
     system_prompt = GENERAL_QUERY_SYSTEM_PROMPT.format(
         logic=state.router["logic"]
@@ -169,10 +156,7 @@ async def get_additional_info(
     logger.info("------continue to get additional info------")
     
     # 使用大模型生成回复
-    if settings.AGENT_SERVICE == ServiceType.DEEPSEEK:
-        model = ChatDeepSeek(api_key=settings.DEEPSEEK_API_KEY, model_name=settings.DEEPSEEK_MODEL, temperature=0.7, tags=["additional_info"])
-    else:
-        model = ChatOllama(model=settings.OLLAMA_AGENT_MODEL, base_url=settings.OLLAMA_BASE_URL, temperature=0.7, tags=["additional_info"])
+    model = LLMFactory.create_agent_model(tags=["additional_info"])
 
     # 如果用户的问题是电商相关，但与自己的业务无关，则需要返回"无关问题"
 
@@ -184,17 +168,7 @@ async def get_additional_info(
         logger.error(f"failed to get Neo4j graph database connection: {e}")
 
     # 定义电商经营范围
-    scope_description = """
-    个人电商经营范围：智能家居产品，包括但不限于：
-    - 智能照明（灯泡、灯带、开关）
-    - 智能安防（摄像头、门锁、传感器）
-    - 智能控制（温控器、遥控器、集线器）
-    - 智能音箱（语音助手、音响）
-    - 智能厨电（电饭煲、冰箱、洗碗机）
-    - 智能清洁（扫地机器人、洗衣机）
-    
-    不包含：服装、鞋类、体育用品、化妆品、食品等非智能家居产品。
-    """
+    scope_description = ECOMMERCE_SCOPE_DESCRIPTION
 
     scope_context = (
         f"参考此范围描述来决策:\n{scope_description}"
@@ -349,13 +323,10 @@ async def create_image_query(
                     image_description = result["choices"][0]["message"]["content"]
                     logger.info(f"Successfully processed image and generated description")
                     # 使用图片描述和用户问题生成最终回复
-                    # 从lg_prompts导入电商客服模板
+                    # 从prompts导入电商客服模板
                     
                     # 构建回复请求
-                    if settings.AGENT_SERVICE == ServiceType.DEEPSEEK:
-                        model = ChatDeepSeek(api_key=settings.DEEPSEEK_API_KEY, model_name=settings.DEEPSEEK_MODEL, temperature=0.7, tags=["image_query"])
-                    else:
-                        model = ChatOllama(model=settings.OLLAMA_AGENT_MODEL, base_url=settings.OLLAMA_BASE_URL, temperature=0.7, tags=["image_query"])
+                    model = LLMFactory.create_agent_model(tags=["image_query"])
                     # 使用专门的图片查询提示模板
                     system_prompt = GET_IMAGE_SYSTEM_PROMPT.format(
                         image_description=image_description
@@ -399,10 +370,7 @@ async def create_research_plan(
     logger.info("------execute local knowledge base query------")
 
     # 使用大模型生成查询/多跳、并行查询计划
-    if settings.AGENT_SERVICE == ServiceType.DEEPSEEK:
-        model = ChatDeepSeek(api_key=settings.DEEPSEEK_API_KEY, model_name=settings.DEEPSEEK_MODEL, temperature=0.7, tags=["research_plan"])
-    else:
-        model = ChatOllama(model=settings.OLLAMA_AGENT_MODEL, base_url=settings.OLLAMA_BASE_URL, temperature=0.7, tags=["research_plan"])
+    model = LLMFactory.create_agent_model(tags=["research_plan"])
     
     # 初始化必要参数
     # 1. Neo4j图数据库连接 - 使用配置中的连接信息
@@ -423,17 +391,7 @@ async def create_research_plan(
     from app.lg_agent.kg_sub_graph.agentic_rag_agents.components.predefined_cypher.cypher_dict import predefined_cypher_dict
 
     # 定义电商经营范围
-    scope_description = """
-    个人电商经营范围：智能家居产品，包括但不限于：
-    - 智能照明（灯泡、灯带、开关）
-    - 智能安防（摄像头、门锁、传感器）
-    - 智能控制（温控器、遥控器、集线器）
-    - 智能音箱（语音助手、音响）
-    - 智能厨电（电饭煲、冰箱、洗碗机）
-    - 智能清洁（扫地机器人、洗衣机）
-    
-    不包含：服装、鞋类、体育用品、化妆品、食品等非智能家居产品。
-    """
+    scope_description = ECOMMERCE_SCOPE_DESCRIPTION
 
     # 创建多工具工作流
     multi_tool_workflow = create_multi_tool_workflow(
@@ -446,7 +404,6 @@ async def create_research_plan(
         llm_cypher_validation=True,
     )
     
-    # return multi_tool_workflow
     # 准备输入状态
     last_message = state.messages[-1].content if state.messages else ""
     input_state = {
@@ -458,42 +415,6 @@ async def create_research_plan(
     # 执行工作流
     response = await multi_tool_workflow.ainvoke(input_state)
     return {"messages": [AIMessage(content=response["answer"])]}
-
-async def check_hallucinations(
-    state: AgentState, *, config: RunnableConfig
-) -> dict[str, Any]:
-    """Analyze the user's query and checks if the response is supported by the set of facts based on the document retrieved,
-    providing a binary score result.
-
-    This function uses a language model to analyze the user's query and gives a binary score result.
-
-    Args:
-        state (AgentState): The current state of the agent, including conversation history.
-        config (RunnableConfig): Configuration with the model used for query analysis.
-
-    Returns:
-        dict[str, Router]: A dictionary containing the 'router' key with the classification result (classification type and logic).
-    """
-    if settings.AGENT_SERVICE == ServiceType.DEEPSEEK:
-        model = ChatDeepSeek(api_key=settings.DEEPSEEK_API_KEY, model_name=settings.DEEPSEEK_MODEL, temperature=0.7, tags=["hallucinations"])
-    else:
-        model = ChatOllama(model=settings.OLLAMA_AGENT_MODEL, base_url=settings.OLLAMA_BASE_URL, temperature=0.7, tags=["hallucinations"])
-    
-    system_prompt = CHECK_HALLUCINATIONS.format(
-        documents=state.documents,
-        generation=state.messages[-1]
-    )
-
-    messages = [
-        {"role": "system", "content": system_prompt}
-    ] + state.messages
-
-    logger.info("---CHECK HALLUCINATIONS---")
-    
-    response = cast(GradeHallucinations, await model.with_structured_output(GradeHallucinations).ainvoke(messages))
-    
-    return {"hallucination": response} 
-
 
 # 定义持久化存储，也可以使用SQLiteSaver()、PostgresSaver()等
 # LangGraph官方地址：https://langchain-ai.github.io/langgraph/how-tos/persistence/
@@ -515,6 +436,3 @@ builder.add_conditional_edges("analyze_and_route_query", route_query)
 
 
 graph = builder.compile(checkpointer=checkpointer)
-
-# from IPython.display import Image, display
-# display(Image(graph.get_graph().draw_mermaid_png()))
