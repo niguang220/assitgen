@@ -317,16 +317,21 @@ async def langgraph_query(
         # 处理文件上传（PDF 等，供 file-query 使用）
         file_path = None
         if file:
+            # 防路径穿越：basename 去掉目录部分，限定 PDF，再校验最终路径仍在目录内
+            safe_name = os.path.basename(file.filename or "")
+            if safe_name in ("", ".", "..") or not safe_name.lower().endswith(".pdf"):
+                raise HTTPException(status_code=400, detail="只支持 PDF 文件")
             file_dir = Path("uploads/files")
             file_dir.mkdir(parents=True, exist_ok=True)
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            original_name, ext = os.path.splitext(file.filename)
-            new_filename = f"{original_name}_{timestamp}{ext}"
-            file_path = file_dir / new_filename
+            stem, ext = os.path.splitext(safe_name)
+            file_path = file_dir / f"{stem}_{timestamp}{ext}"
+            if not file_path.resolve().is_relative_to(file_dir.resolve()):
+                raise HTTPException(status_code=400, detail="非法文件名")
             content = await file.read()
             with open(file_path, "wb") as f:
                 f.write(content)
-            logger.info(f"Saved file {new_filename} for user {user_id}")
+            logger.info(f"Saved file {file_path.name} for user {user_id}")
 
         # 使用conversation_id作为thread_id，如果没有提供则创建新的
         thread_id = conversation_id if conversation_id else new_uuid()
