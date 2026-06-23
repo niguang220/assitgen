@@ -287,7 +287,8 @@ async def langgraph_query(
     query: str = Form(...),
     user_id: int = Form(...),
     conversation_id: Optional[str] = Form(None),
-    image: Optional[UploadFile] = File(None)
+    image: Optional[UploadFile] = File(None),
+    file: Optional[UploadFile] = File(None)
 ):
     """使用LangGraph处理用户查询，支持图片上传"""
     try:
@@ -296,30 +297,49 @@ async def langgraph_query(
         # 处理图片上传
         image_path = None
         if image:
-            # 创建图片存储目录
+            # 防路径穿越：basename 去掉目录部分，再校验最终路径仍在目录内
+            safe_name = os.path.basename(image.filename or "")
+            if not safe_name or safe_name in (".", ".."):
+                raise HTTPException(status_code=400, detail="非法图片文件名")
             image_dir = Path("uploads/images")
             image_dir.mkdir(parents=True, exist_ok=True)
-            
-            # 生成带时间戳的文件名
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            original_name, ext = os.path.splitext(image.filename)
-            new_filename = f"{original_name}_{timestamp}{ext}"
-            image_path = image_dir / new_filename
-            
-            # 保存图片
+            stem, ext = os.path.splitext(safe_name)
+            image_path = image_dir / f"{stem}_{timestamp}{ext}"
+            if not image_path.resolve().is_relative_to(image_dir.resolve()):
+                raise HTTPException(status_code=400, detail="非法图片文件名")
             content = await image.read()
             with open(image_path, "wb") as f:
                 f.write(content)
-            
-            logger.info(f"Saved image {new_filename} for user {user_id}")
-        
+            logger.info(f"Saved image {image_path.name} for user {user_id}")
+
+        # 处理文件上传（PDF 等，供 file-query 使用）
+        file_path = None
+        if file:
+            # 防路径穿越：basename 去掉目录部分，限定 PDF，再校验最终路径仍在目录内
+            safe_name = os.path.basename(file.filename or "")
+            if safe_name in ("", ".", "..") or not safe_name.lower().endswith(".pdf"):
+                raise HTTPException(status_code=400, detail="只支持 PDF 文件")
+            file_dir = Path("uploads/files")
+            file_dir.mkdir(parents=True, exist_ok=True)
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            stem, ext = os.path.splitext(safe_name)
+            file_path = file_dir / f"{stem}_{timestamp}{ext}"
+            if not file_path.resolve().is_relative_to(file_dir.resolve()):
+                raise HTTPException(status_code=400, detail="非法文件名")
+            content = await file.read()
+            with open(file_path, "wb") as f:
+                f.write(content)
+            logger.info(f"Saved file {file_path.name} for user {user_id}")
+
         # 使用conversation_id作为thread_id，如果没有提供则创建新的
         thread_id = conversation_id if conversation_id else new_uuid()
         thread_config = {
             "configurable": {
                 "thread_id": thread_id, 
                 "user_id": user_id,
-                "image_path": str(image_path) if image_path else None
+                "image_path": str(image_path) if image_path else None,
+                "file_path": str(file_path) if file_path else None
             }
         }
         
