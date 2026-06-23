@@ -8,6 +8,7 @@ class Router(TypedDict):
     """Classify user query."""
     logic: str
     type: Literal["general-query", "additional-query", "graphrag-query", "image-query", "file-query"]
+    confidence: Literal["high", "low"]
     question: str = field(default_factory=str)
 
 # @dataclass(kw_only=True)： 强制要求数据类中的所有字段必须以关键字参数的形式提供。即不能以位置参数的方式传递。

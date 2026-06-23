@@ -102,6 +102,11 @@ def route_query(
     """
     _type = state.router["type"]
 
+    # 分类器不确定、且倾向于知识库类查询时，安全降级为"反问要信息"，避免没把握时硬答错
+    if state.router.get("confidence") == "low" and _type in ("graphrag-query", "additional-query"):
+        logger.info(f"Low-confidence '{_type}' -> falling back to get_additional_info")
+        return "get_additional_info"
+
     if _type == "general-query":
         return "respond_to_general_query"
     elif _type == "additional-query":
