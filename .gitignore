@@ -19,6 +19,9 @@ uploads/
 logs/
 *.log
 
+# RAG 文件索引（运行时生成的 FAISS 索引）
+indexes/
+
 # 开发过程文件
 docs/
 app/test/

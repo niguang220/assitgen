@@ -172,4 +172,13 @@ class EmbeddingService:
             return results
                 
         except Exception as e:
-            raise Exception(f"搜索失败: {str(e)}") 
+            raise Exception(f"搜索失败: {str(e)}")
+
+    async def query_file(self, file_path: str, question: str, top_k: int = 3) -> List[dict]:
+        """确保文件已索引(没有就建一次并存盘,有就直接加载),再返回 top_k 相关片段。"""
+        file_hash = hashlib.md5(file_path.encode()).hexdigest()
+        index_path = self.index_dir / f"index_{file_hash}.bin"
+        if not index_path.exists():
+            await self.create_embeddings(file_path, str(self.index_dir))
+        self._load_index(f"index_{file_hash}")
+        return await self.search(question, top_k)
