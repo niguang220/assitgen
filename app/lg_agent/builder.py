@@ -14,12 +14,12 @@ from langgraph.graph import START, StateGraph
 from app.core.config import settings
 from app.core.logger import get_logger
 from app.services.llm_factory import LLMFactory
-from app.lg_agent.lg_states import AgentState, InputState, Router
+from app.lg_agent.state import AgentState, InputState, Router
 from app.lg_agent.kg_sub_graph.kg_neo4j_conn import get_neo4j_graph
 from app.lg_agent.kg_sub_graph.agentic_rag_agents.retrievers.cypher_examples.northwind_retriever import NorthwindCypherRetriever
 from app.lg_agent.kg_sub_graph.agentic_rag_agents.workflows.multi_agent.multi_tool import create_multi_tool_workflow
 from app.lg_agent.kg_sub_graph.agentic_rag_agents.components.utils.utils import retrieve_and_parse_schema_from_graph_for_prompts
-from app.lg_agent.lg_prompts import (
+from app.lg_agent.prompts import (
     ROUTER_SYSTEM_PROMPT,
     GET_ADDITIONAL_SYSTEM_PROMPT,
     GENERAL_QUERY_SYSTEM_PROMPT,
@@ -38,7 +38,7 @@ class AdditionalGuardrailsOutput(BaseModel):
 
 
 # 构建日志记录器
-logger = get_logger(service="lg_builder")
+logger = get_logger(service="builder")
 
 # 电商经营范围描述，供 guardrails 判断与研究计划节点共用
 ECOMMERCE_SCOPE_DESCRIPTION = """
@@ -323,7 +323,7 @@ async def create_image_query(
                     image_description = result["choices"][0]["message"]["content"]
                     logger.info(f"Successfully processed image and generated description")
                     # 使用图片描述和用户问题生成最终回复
-                    # 从lg_prompts导入电商客服模板
+                    # 从prompts导入电商客服模板
                     
                     # 构建回复请求
                     model = LLMFactory.create_agent_model(tags=["image_query"])

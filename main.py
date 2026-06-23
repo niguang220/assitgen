@@ -22,9 +22,9 @@ import uuid
 import os
 from app.services.indexing_service import IndexingService
 import sys
-from app.lg_agent.lg_states import AgentState, InputState
+from app.lg_agent.state import AgentState, InputState
 from app.lg_agent.utils import new_uuid
-from app.lg_agent.lg_builder import graph
+from app.lg_agent.builder import graph
 from langgraph.types import Command
 import json
 
