@@ -166,6 +166,7 @@ async def get_additional_info(
         logger.info("success to get Neo4j graph database connection")
     except Exception as e:
         logger.error(f"failed to get Neo4j graph database connection: {e}")
+        neo4j_graph = None
 
     # 定义电商经营范围
     scope_description = ECOMMERCE_SCOPE_DESCRIPTION
@@ -379,6 +380,7 @@ async def create_research_plan(
         logger.info("success to get Neo4j graph database connection")
     except Exception as e:
         logger.error(f"failed to get Neo4j graph database connection: {e}")
+        neo4j_graph = None
 
     # 2. 创建自定义检索器实例，根据 Graph Schema 创建 Cypher 示例，用来引导大模型生成正确的Cypher 查询语句
     cypher_retriever = NorthwindCypherRetriever()

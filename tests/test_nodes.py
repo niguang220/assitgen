@@ -7,6 +7,7 @@ LLMFactory.create_agent_model, we fake the model in one place.
 from unittest.mock import AsyncMock, MagicMock
 
 from langchain_core.messages import AIMessage, HumanMessage
+from langchain_core.runnables import RunnableLambda
 
 import app.lg_agent.builder as builder
 from app.lg_agent.state import AgentState
@@ -46,3 +47,31 @@ async def test_image_query_without_image_returns_friendly_message():
     result = await builder.create_image_query(state, config={"configurable": {}})
 
     assert "无法查看这张图片" in result["messages"][0].content
+
+
+async def test_additional_info_survives_neo4j_being_down(monkeypatch):
+    """Regression: if Neo4j is unavailable, get_additional_info must not crash
+    with a NameError on an unbound neo4j_graph — it should still run guardrails.
+    """
+    def _neo4j_down():
+        raise RuntimeError("neo4j down")
+
+    monkeypatch.setattr(builder, "get_neo4j_graph", _neo4j_down)
+
+    # the guardrails chain is `prompt | model.with_structured_output(...)`;
+    # make that structured runnable decide "end" (out of scope)
+    fake_model = MagicMock()
+    fake_model.with_structured_output.return_value = RunnableLambda(
+        lambda _: builder.AdditionalGuardrailsOutput(decision="end")
+    )
+    monkeypatch.setattr(
+        builder.LLMFactory, "create_agent_model", lambda **kwargs: fake_model
+    )
+
+    state = AgentState(
+        messages=[HumanMessage(content="你们卖鞋吗")],
+        router={"type": "additional-query", "logic": ""},
+    )
+    result = await builder.get_additional_info(state, config={})
+
+    assert "没有这方面的商品" in result["messages"][0].content
