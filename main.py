@@ -287,7 +287,8 @@ async def langgraph_query(
     query: str = Form(...),
     user_id: int = Form(...),
     conversation_id: Optional[str] = Form(None),
-    image: Optional[UploadFile] = File(None)
+    image: Optional[UploadFile] = File(None),
+    file: Optional[UploadFile] = File(None)
 ):
     """使用LangGraph处理用户查询，支持图片上传"""
     try:
@@ -312,14 +313,29 @@ async def langgraph_query(
                 f.write(content)
             
             logger.info(f"Saved image {new_filename} for user {user_id}")
-        
+
+        # 处理文件上传（PDF 等，供 file-query 使用）
+        file_path = None
+        if file:
+            file_dir = Path("uploads/files")
+            file_dir.mkdir(parents=True, exist_ok=True)
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            original_name, ext = os.path.splitext(file.filename)
+            new_filename = f"{original_name}_{timestamp}{ext}"
+            file_path = file_dir / new_filename
+            content = await file.read()
+            with open(file_path, "wb") as f:
+                f.write(content)
+            logger.info(f"Saved file {new_filename} for user {user_id}")
+
         # 使用conversation_id作为thread_id，如果没有提供则创建新的
         thread_id = conversation_id if conversation_id else new_uuid()
         thread_config = {
             "configurable": {
                 "thread_id": thread_id, 
                 "user_id": user_id,
-                "image_path": str(image_path) if image_path else None
+                "image_path": str(image_path) if image_path else None,
+                "file_path": str(file_path) if file_path else None
             }
         }
         

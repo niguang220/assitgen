@@ -201,3 +201,45 @@ async def test_file_query_happy_path_feeds_retrieved_context(monkeypatch, tmp_pa
     assert result["messages"][0].content == "亲~保修两年哦😊"
     sent = fake_model.ainvoke.call_args.args[0]
     assert "保修期是两年" in sent[0]["content"]  # 检索片段进了 prompt
+
+
+def _router_model_returning(router_type: str):
+    structured = MagicMock()
+    structured.ainvoke = AsyncMock(
+        return_value={
+            "type": router_type,
+            "logic": "x",
+            "confidence": "high",
+            "question": "",
+        }
+    )
+    fake_model = MagicMock()
+    fake_model.with_structured_output = MagicMock(return_value=structured)
+    return fake_model
+
+
+async def test_uploaded_file_forces_file_query_routing(monkeypatch):
+    # 上传文件是强信号 -> 即使 LLM 判成别的,也强制走 file-query
+    monkeypatch.setattr(
+        builder.LLMFactory,
+        "create_agent_model",
+        lambda **kwargs: _router_model_returning("general-query"),
+    )
+    state = AgentState(messages=[HumanMessage(content="看看这个")])
+    result = await builder.analyze_and_route_query(
+        state, config={"configurable": {"file_path": "/x.pdf"}}
+    )
+    assert result["router"]["type"] == "file-query"
+
+
+async def test_uploaded_image_forces_image_query_routing(monkeypatch):
+    monkeypatch.setattr(
+        builder.LLMFactory,
+        "create_agent_model",
+        lambda **kwargs: _router_model_returning("general-query"),
+    )
+    state = AgentState(messages=[HumanMessage(content="看看这个")])
+    result = await builder.analyze_and_route_query(
+        state, config={"configurable": {"image_path": "/x.jpg"}}
+    )
+    assert result["router"]["type"] == "image-query"

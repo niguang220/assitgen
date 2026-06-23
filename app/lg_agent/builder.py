@@ -104,6 +104,14 @@ async def analyze_and_route_query(
         Router, await model.with_structured_output(Router).ainvoke(messages)
     )
     logger.info(f"Analyze user query type completed, result: {response}")
+
+    # 上传了文件/图片时，强制路由到对应分支（上传本身就是强信号，不依赖 LLM 文本分类）
+    configurable = config.get("configurable", {})
+    if configurable.get("file_path"):
+        response["type"] = "file-query"
+    elif configurable.get("image_path"):
+        response["type"] = "image-query"
+
     return {"router": response}
 
 def route_query(
