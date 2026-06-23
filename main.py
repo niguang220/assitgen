@@ -297,22 +297,21 @@ async def langgraph_query(
         # 处理图片上传
         image_path = None
         if image:
-            # 创建图片存储目录
+            # 防路径穿越：basename 去掉目录部分，再校验最终路径仍在目录内
+            safe_name = os.path.basename(image.filename or "")
+            if not safe_name or safe_name in (".", ".."):
+                raise HTTPException(status_code=400, detail="非法图片文件名")
             image_dir = Path("uploads/images")
             image_dir.mkdir(parents=True, exist_ok=True)
-            
-            # 生成带时间戳的文件名
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            original_name, ext = os.path.splitext(image.filename)
-            new_filename = f"{original_name}_{timestamp}{ext}"
-            image_path = image_dir / new_filename
-            
-            # 保存图片
+            stem, ext = os.path.splitext(safe_name)
+            image_path = image_dir / f"{stem}_{timestamp}{ext}"
+            if not image_path.resolve().is_relative_to(image_dir.resolve()):
+                raise HTTPException(status_code=400, detail="非法图片文件名")
             content = await image.read()
             with open(image_path, "wb") as f:
                 f.write(content)
-            
-            logger.info(f"Saved image {new_filename} for user {user_id}")
+            logger.info(f"Saved image {image_path.name} for user {user_id}")
 
         # 处理文件上传（PDF 等，供 file-query 使用）
         file_path = None
