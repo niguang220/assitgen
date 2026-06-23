@@ -16,6 +16,7 @@ from langgraph.graph import START, StateGraph
 from app.core.config import settings
 from app.core.logger import get_logger
 from app.services.llm_factory import LLMFactory
+from app.services.embedding_service import EmbeddingService
 from app.lg_agent.state import AgentState, InputState, Router
 from app.lg_agent.kg_sub_graph.kg_neo4j_conn import get_neo4j_graph
 from app.lg_agent.kg_sub_graph.agentic_rag_agents.retrievers.cypher_examples.northwind_retriever import NorthwindCypherRetriever
@@ -28,6 +29,7 @@ from app.lg_agent.prompts import (
     GET_IMAGE_SYSTEM_PROMPT,
     GUARDRAILS_SYSTEM_PROMPT,
     IMAGE_ANALYSIS_SYSTEM_PROMPT,
+    FILE_QUERY_SYSTEM_PROMPT,
 )
 
 
@@ -55,6 +57,21 @@ ECOMMERCE_SCOPE_DESCRIPTION = """
 
     不包含：服装、鞋类、体育用品、化妆品、食品等非智能家居产品。
     """
+
+# 文件问答的兜底话术
+FILE_REUPLOAD_MSG = "抱歉，我没有收到文件，请上传文件后再提问。"
+FILE_UNREADABLE_MSG = "抱歉，这个文件我暂时无法读取，请确认是 PDF 后重试。"
+FILE_NO_MATCH_MSG = "抱歉，我在文件里没有找到相关信息。"
+
+# 懒加载的 EmbeddingService 单例（模型很重，只在第一次 file-query 时实例化）
+_embedding_service = None
+
+
+def _get_embedding_service() -> EmbeddingService:
+    global _embedding_service
+    if _embedding_service is None:
+        _embedding_service = EmbeddingService()
+    return _embedding_service
 
 async def analyze_and_route_query(
     state: AgentState, *, config: RunnableConfig
@@ -339,7 +356,32 @@ async def create_image_query(
 async def create_file_query(
     state: AgentState, *, config: RunnableConfig
 ) -> Dict[str, List[BaseMessage]]:
-    """Create a file query."""
+    """用 RAG 回答关于用户上传文件(PDF)的问题。
+
+    错误分两类:文件本身的问题(让用户重传)vs. 检索为空(如实说没找到)。
+    """
+    logger.info("-----Found User Upload File-----")
+    file_path = config.get("configurable", {}).get("file_path", None)
+    if not file_path or not Path(file_path).exists():
+        logger.warning(f"User upload file not found: {file_path}")
+        return {"messages": [AIMessage(content=FILE_REUPLOAD_MSG)]}
+
+    question = state.messages[-1].content if state.messages else ""
+    try:
+        results = await _get_embedding_service().query_file(file_path, question, top_k=3)
+    except Exception as e:
+        logger.error(f"Failed to read/index file {file_path}: {e}")
+        return {"messages": [AIMessage(content=FILE_UNREADABLE_MSG)]}
+
+    if not results:
+        return {"messages": [AIMessage(content=FILE_NO_MATCH_MSG)]}
+
+    context = "\n\n".join(r["content"] for r in results)
+    model = LLMFactory.create_agent_model(tags=["file_query"])
+    system_prompt = FILE_QUERY_SYSTEM_PROMPT.format(context=context)
+    messages = [{"role": "system", "content": system_prompt}] + state.messages
+    response = await model.ainvoke(messages)
+    return {"messages": [response]}
     
     # TODO
 

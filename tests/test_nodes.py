@@ -133,3 +133,71 @@ async def test_image_query_happy_path_feeds_description_into_reply(monkeypatch, 
     # the vision description was injected into the reply's system prompt
     sent = fake_model.ainvoke.call_args.args[0]
     assert "一把智能门锁" in sent[0]["content"]
+
+
+async def test_file_query_without_file_asks_to_upload():
+    state = AgentState(
+        messages=[HumanMessage(content="看看我的文件")],
+        router={"type": "file-query", "logic": ""},
+    )
+    result = await builder.create_file_query(state, config={"configurable": {}})
+    assert "上传文件" in result["messages"][0].content
+
+
+async def test_file_query_no_results_says_not_found(monkeypatch, tmp_path):
+    f = tmp_path / "doc.pdf"
+    f.write_bytes(b"x")  # 只需存在;query_file 被 mock
+    fake = MagicMock()
+    fake.query_file = AsyncMock(return_value=[])
+    monkeypatch.setattr(builder, "_get_embedding_service", lambda: fake)
+    state = AgentState(
+        messages=[HumanMessage(content="保修多久")],
+        router={"type": "file-query", "logic": ""},
+    )
+    result = await builder.create_file_query(
+        state, config={"configurable": {"file_path": str(f)}}
+    )
+    assert "没有找到相关信息" in result["messages"][0].content
+
+
+async def test_file_query_unreadable_file_reports_error(monkeypatch, tmp_path):
+    f = tmp_path / "doc.pdf"
+    f.write_bytes(b"x")
+
+    async def _raise(*args, **kwargs):
+        raise RuntimeError("bad pdf")
+
+    fake = MagicMock()
+    fake.query_file = _raise
+    monkeypatch.setattr(builder, "_get_embedding_service", lambda: fake)
+    state = AgentState(
+        messages=[HumanMessage(content="保修多久")],
+        router={"type": "file-query", "logic": ""},
+    )
+    result = await builder.create_file_query(
+        state, config={"configurable": {"file_path": str(f)}}
+    )
+    assert "无法读取" in result["messages"][0].content
+
+
+async def test_file_query_happy_path_feeds_retrieved_context(monkeypatch, tmp_path):
+    f = tmp_path / "doc.pdf"
+    f.write_bytes(b"x")
+    fake = MagicMock()
+    fake.query_file = AsyncMock(return_value=[{"content": "保修期是两年"}])
+    monkeypatch.setattr(builder, "_get_embedding_service", lambda: fake)
+    fake_model = MagicMock()
+    fake_model.ainvoke = AsyncMock(return_value=AIMessage(content="亲~保修两年哦😊"))
+    monkeypatch.setattr(
+        builder.LLMFactory, "create_agent_model", lambda **kwargs: fake_model
+    )
+    state = AgentState(
+        messages=[HumanMessage(content="保修多久")],
+        router={"type": "file-query", "logic": ""},
+    )
+    result = await builder.create_file_query(
+        state, config={"configurable": {"file_path": str(f)}}
+    )
+    assert result["messages"][0].content == "亲~保修两年哦😊"
+    sent = fake_model.ainvoke.call_args.args[0]
+    assert "保修期是两年" in sent[0]["content"]  # 检索片段进了 prompt
