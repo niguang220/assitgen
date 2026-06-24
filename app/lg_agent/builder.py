@@ -30,6 +30,7 @@ from app.lg_agent.prompts import (
     GUARDRAILS_SYSTEM_PROMPT,
     IMAGE_ANALYSIS_SYSTEM_PROMPT,
     FILE_QUERY_SYSTEM_PROMPT,
+    CHECK_HALLUCINATIONS,
 )
 
 
@@ -39,6 +40,13 @@ class AdditionalGuardrailsOutput(BaseModel):
     """
     decision: Literal["end", "continue"] = Field(
         description="Decision on whether the question is related to the graph contents."
+    )
+
+
+class GroundingVerdict(BaseModel):
+    """结构化输出：判断客服回复是否完全基于检索到的证据（防幻觉）。"""
+    grounded: bool = Field(
+        description="True if the reply is fully supported by the retrieved evidence; False if it contains unsupported (hallucinated) information."
     )
 
 
@@ -62,6 +70,8 @@ ECOMMERCE_SCOPE_DESCRIPTION = """
 FILE_REUPLOAD_MSG = "抱歉，我没有收到文件，请上传文件后再提问。"
 FILE_UNREADABLE_MSG = "抱歉，这个文件我暂时无法读取，请确认是 PDF 后重试。"
 FILE_NO_MATCH_MSG = "抱歉，我在文件里没有找到相关信息。"
+# 答案没通过 grounding 校验时的兜底：宁可不答，也不吐没依据的内容
+FILE_UNGROUNDED_MSG = "抱歉，我没能从文件里找到可靠依据来回答这个问题，建议您换个问法或核对原文。"
 
 # 懒加载的 EmbeddingService 单例（模型很重，只在第一次 file-query 时实例化）
 _embedding_service = None
@@ -361,6 +371,22 @@ async def create_image_query(
     return {"messages": [response]}
 
 
+async def _verify_grounding(context: str, answer: str) -> bool:
+    """LLM 裁判：判断答案是否完全被检索到的证据支撑（防幻觉）。
+
+    裁判调用本身失败时 fail-open（放行）——基础设施抖动不该误伤正常回答；
+    幻觉拦截是 best-effort 的纵深防御，不是硬性 SLA。
+    """
+    try:
+        judge = LLMFactory.create_agent_model(tags=["grounding_check"], temperature=0)
+        prompt = CHECK_HALLUCINATIONS.format(documents=context, generation=answer)
+        verdict = await judge.with_structured_output(GroundingVerdict).ainvoke(prompt)
+        return bool(verdict.grounded)
+    except Exception as e:
+        logger.error(f"Grounding check failed, passing answer through: {e}")
+        return True
+
+
 async def create_file_query(
     state: AgentState, *, config: RunnableConfig
 ) -> Dict[str, List[BaseMessage]]:
@@ -389,9 +415,13 @@ async def create_file_query(
     system_prompt = FILE_QUERY_SYSTEM_PROMPT.format(context=context)
     messages = [{"role": "system", "content": system_prompt}] + state.messages
     response = await model.ainvoke(messages)
+
+    # 输出校验闸：答案必须由检索证据支撑，否则宁可兜底也不吐幻觉
+    if not await _verify_grounding(context, response.content):
+        logger.warning("File-query answer failed grounding check; returning fallback")
+        return {"messages": [AIMessage(content=FILE_UNGROUNDED_MSG)]}
     return {"messages": [response]}
-    
-    # TODO
+
 
 async def create_research_plan(
     state: AgentState, *, config: RunnableConfig
