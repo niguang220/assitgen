@@ -9,11 +9,15 @@ import hashlib
 import time
 import PyPDF2
 
+# 索引目录锚定到项目根，避免依赖当前工作目录（相对路径在别处启动会跑偏）
+_INDEX_DIR = Path(__file__).resolve().parent.parent.parent / "indexes"
+
+
 class EmbeddingService:
     def __init__(self):
         # 使用多语言模型以支持中文
         self.model = SentenceTransformer('paraphrase-multilingual-MiniLM-L12-v2')
-        self.index_dir = Path("indexes")
+        self.index_dir = _INDEX_DIR
         self.index_dir.mkdir(exist_ok=True)
         
         # 初始化空索引和文档存储
@@ -39,8 +43,8 @@ class EmbeddingService:
         file_hash = hashlib.md5(file_path.encode()).hexdigest()
         return f"indexes/index_{file_hash}.bin"
     
-    async def create_embeddings(self, file_path: str, index_dir: str) -> Dict:
-        """从文件创建向量索引"""
+    async def create_embeddings(self, file_path: str, file_id: str) -> Dict:
+        """从文件创建向量索引；file_id 决定索引保存名（调用方传文件内容哈希，做到同内容只索引一次）。"""
         try:
             # 读取 PDF 文件内容
             text_chunks = []
@@ -59,10 +63,8 @@ class EmbeddingService:
             # 添加向量到索引
             index.add(vectors)
             
-            # 生成文件 ID
-            file_hash = hashlib.md5(file_path.encode()).hexdigest()
-            index_id = f"index_{file_hash}"
-            
+            index_id = f"index_{file_id}"
+
             # 创建文档数据
             documents = {}
             for i, text in enumerate(text_chunks):
@@ -75,7 +77,7 @@ class EmbeddingService:
                 }
             
             # 保存索引和文档数据
-            self._save_index(file_hash, index, documents)
+            self._save_index(file_id, index, documents)
             
             return {
                 "status": "success",
@@ -175,10 +177,14 @@ class EmbeddingService:
             raise Exception(f"搜索失败: {str(e)}")
 
     async def query_file(self, file_path: str, question: str, top_k: int = 3) -> List[dict]:
-        """确保文件已索引(没有就建一次并存盘,有就直接加载),再返回 top_k 相关片段。"""
-        file_hash = hashlib.md5(file_path.encode()).hexdigest()
-        index_path = self.index_dir / f"index_{file_hash}.bin"
+        """确保文件已索引(没有就建一次并存盘,有就直接加载),再返回 top_k 相关片段。
+
+        索引按【文件内容】哈希命名：同一份内容即使换了文件名也只索引一次。
+        """
+        with open(file_path, "rb") as f:
+            content_hash = hashlib.md5(f.read()).hexdigest()
+        index_path = self.index_dir / f"index_{content_hash}.bin"
         if not index_path.exists():
-            await self.create_embeddings(file_path, str(self.index_dir))
-        self._load_index(f"index_{file_hash}")
+            await self.create_embeddings(file_path, content_hash)
+        self._load_index(f"index_{content_hash}")
         return await self.search(question, top_k)
